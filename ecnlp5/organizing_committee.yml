@@ -1,6 +1,6 @@
 - members:
   - first_name: Shervin
-    institution: Amazon Research, USA
+    institution: Amazon, USA
     last_name: Malmasi
   - first_name: Surya 
     institution: Lowe's Companies, Inc, USA
@@ -12,9 +12,9 @@
     institution: Emory University, USA
     last_name: Agichtein
   - first_name: Oleg
-    institution: Amazon Research, USA
+    institution: Amazon, USA
     last_name: Rokhlenko
   - first_name: Ido
-    institution: Facebook, Israel
+    institution: Meta AI, Israel
     last_name: Guy
   role: Program Chairs
