@@ -1,18 +1,21 @@
 from collections import defaultdict
 from pathlib import Path
-from PyPDF2 import PdfFileReader, PdfFileWriter
+from PyPDF2 import PdfFileReader
 
-from aclpub2.templates import load_template, TEMPLATE_DIR
+from aclpub2.templates import load_template, homoglyph, TEMPLATE_DIR
 
+import multiprocessing
 import subprocess
 import yaml
 import roman
 import shutil
+import os
+import traceback
 
 PARENT_DIR = Path(__file__).parent
 
 
-def generate_proceedings(path: str, overwrite: bool):
+def generate_proceedings(path: str, overwrite: bool, outdir: str):
     root = Path(path)
     build_dir = Path("build")
     build_dir.mkdir(exist_ok=True)
@@ -22,6 +25,9 @@ def generate_proceedings(path: str, overwrite: bool):
         raise Exception(
             f"Build directory {build_dir} is not empty, and the overwrite flag is false."
         )
+    if overwrite:
+        shutil.rmtree(str(build_dir), ignore_errors=True)
+        build_dir.mkdir()
 
     # Load and preprocess the .yml configuration.
     (
@@ -32,14 +38,47 @@ def generate_proceedings(path: str, overwrite: bool):
         organizing_committee,
         program_committee,
         invited_talks,
+        program,
     ) = load_configs(root)
-    id_to_paper, alphabetized_author_index = process_papers(papers, root, pax=True)
+    id_to_paper, alphabetized_author_index = process_papers(papers, root)
+
+    sessions_by_date = None
+    if program is not None:
+        try:
+            sessions_by_date = process_program_proceedings(program)
+        except:
+            print("Sorry. Your program.yml file seems malformed. It will be skipped.")
+            traceback.print_exc()
+            sessions_by_date = None
+    generate_watermarked_pdfs(id_to_paper.values(), conference, root)
 
     template = load_template("proceedings")
-
-    # Check if sponsors is None
-    if sponsors is None:
-        sponsors = ""
+    rendered_template = template.render(
+        root=str(root),
+        conference=conference,
+        conference_dates=get_conference_dates(conference),
+        sponsors=sponsors,
+        prefaces=prefaces,
+        organizing_committee=organizing_committee,
+        program_committee=program_committee,
+        invited_talks=invited_talks,
+        papers=papers,
+        id_to_paper=id_to_paper,
+        program=sessions_by_date,
+        alphabetized_author_index=alphabetized_author_index,
+        include_papers=False,
+    )
+    tex_file = Path(build_dir, "front_matter.tex")
+    with open(tex_file, "w+") as f:
+        f.write(rendered_template)
+    subprocess.run(
+        [
+            "pdflatex",
+            f"-output-directory={build_dir}",
+            "-save-size=40000",
+            str(tex_file),
+        ]
+    )
 
     rendered_template = template.render(
         root=str(root),
@@ -52,28 +91,46 @@ def generate_proceedings(path: str, overwrite: bool):
         invited_talks=invited_talks,
         papers=papers,
         id_to_paper=id_to_paper,
+        program=sessions_by_date,
         alphabetized_author_index=alphabetized_author_index,
+        include_papers=True,
     )
     tex_file = Path(build_dir, "proceedings.tex")
     with open(tex_file, "w+") as f:
         f.write(rendered_template)
-    subprocess.run(["pdflatex", f"-output-directory={build_dir}", str(tex_file)])
+    subprocess.run(
+        [
+            "pdflatex",
+            f"-output-directory={build_dir}",
+            "-save-size=40000",
+            str(tex_file),
+        ]
+    )
 
-    # Split the proceedings into watermarked PDFs.
-    watermarked_pdfs = Path(build_dir, "watermarked_pdfs")
-    watermarked_pdfs.mkdir(exist_ok=True)
-    proceedings_file = Path(build_dir, "proceedings.pdf")
-    proceedings_pdf = PdfFileReader(open(proceedings_file, "rb"))
-    page_offset = find_page_offset(proceedings_pdf)
-    for paper in papers:
-        start, end = paper["page_range"]
-        output = PdfFileWriter()
-        for i in range(start, end + 1):
-            output.addPage(proceedings_pdf.getPage(page_offset + i))
-        with open(
-            Path(watermarked_pdfs, f"{str(paper['id'])}_watermarked.pdf"), "wb"
-        ) as output_file:
-            output.write(output_file)
+    output_dir = Path(outdir)
+    shutil.rmtree(str(output_dir), ignore_errors=True)
+    output_dir.mkdir()
+    rearrange_outputs(root, build_dir, output_dir)
+
+
+def rearrange_outputs(input_path: Path, build_dir: Path, output_dir: Path):
+    # Copy proceedings
+    shutil.copy2(
+        Path(build_dir, "proceedings.pdf"), Path(output_dir, "proceedings.pdf")
+    )
+    # Copy watermarked PDFs.
+    output_watermarked = Path(output_dir, "watermarked_pdfs")
+    output_watermarked.mkdir()
+    for file in Path(build_dir, "watermarked_pdfs").glob("*.pdf"):
+        shutil.copy2(file, output_watermarked)
+    # Copy the front matter as 0.pdf.
+    shutil.copy2(Path(build_dir, "front_matter.pdf"), Path(output_watermarked, "0.pdf"))
+    # Copy the inputs.
+    shutil.copytree(input_path, Path(output_dir, "inputs"))
+    # Copy the attachments.
+    attachments_path = os.path.join(input_path, "attachments")
+    if os.path.isdir(attachments_path):
+        shutil.copytree(attachments_path, Path(output_dir, "attachments"))
 
 
 def find_page_offset(proceedings_pdf):
@@ -130,7 +187,7 @@ def generate_handbook(path: str, overwrite: bool):
         workshop_days,
     ) = load_configs_handbook(root)
 
-    id_to_paper, alphabetized_author_index = process_papers(papers, root, True)
+    id_to_paper, alphabetized_author_index = process_papers(papers, root)
 
     template = load_template("handbook")
     program = process_program_handbook(program)
@@ -178,7 +235,7 @@ def get_conference_dates(conference) -> str:
     return f"{start_month} {start_date.day} - {end_month} {end_date.day}"
 
 
-def process_papers(papers, root: Path, pax: bool):
+def process_papers(papers, root: Path):
     """
     process_papers
     - uses PAX to extract PDF annotations from the paper files in preparation for
@@ -193,16 +250,6 @@ def process_papers(papers, root: Path, pax: bool):
     author_to_pages = defaultdict(list)
     for paper in papers:
         pdf_path = Path(root, "papers", paper["file"])
-        if pax:
-            subprocess.run(
-                [
-                    "java",
-                    "-cp",
-                    f"{PARENT_DIR}/pax.jar:{PARENT_DIR}/pdfbox.jar",
-                    "pax.PDFAnnotExtractor",
-                    pdf_path,
-                ]
-            )
         pdf = PdfFileReader(str(pdf_path))
         paper["num_pages"] = pdf.getNumPages()
         paper["page_range"] = (page, page + pdf.getNumPages() - 1)
@@ -216,8 +263,86 @@ def process_papers(papers, root: Path, pax: bool):
         page += pdf.getNumPages()
     alphabetized_author_index = defaultdict(list)
     for author, pages in sorted(author_to_pages.items()):
-        alphabetized_author_index[author[0].lower()].append((author, pages))
+        alphabetized_author_index[homoglyph(author[0]).lower()].append((author, pages))
+    for author_pages in alphabetized_author_index.values():
+        author_pages.sort(key=lambda entry: entry[0].lower())
     return id_to_paper, sorted(alphabetized_author_index.items())
+
+
+def generate_watermarked_pdfs(papers_with_pages, conference, root: Path):
+    build_dir = Path("build")
+    watermarked_pdfs = Path(build_dir, "watermarked_pdfs")
+    watermarked_pdfs.mkdir(exist_ok=True)
+    with multiprocessing.Pool(processes=multiprocessing.cpu_count()) as pool:
+        for paper in papers_with_pages:
+            pool.apply_async(
+                create_watermarked_pdf,
+                args=(paper, conference, root),
+            )
+        pool.close()
+        pool.join()
+
+
+def create_watermarked_pdf(paper, conference, root: Path):
+    build_dir = Path("build")
+    watermarked_pdfs = Path(build_dir, "watermarked_pdfs")
+    template = load_template("watermarked_pdf")
+    rendered_template = template.render(
+        root=root,
+        paper=paper,
+        conference=conference,
+        conference_dates=get_conference_dates(conference),
+    )
+    tex_file = Path(watermarked_pdfs, f"{paper['id']}.tex")
+    with open(tex_file, "w+") as f:
+        f.write(rendered_template)
+    pdf_path = Path(root, "papers", paper["file"])
+    pax_path = pdf_path.with_suffix(".pax")
+    if not pax_path.exists():
+        subprocess.call(
+            [
+                "java",
+                "-cp",
+                f"{PARENT_DIR}/pax.jar:{PARENT_DIR}/pdfbox.jar",
+                "pax.PDFAnnotExtractor",
+                pdf_path,
+            ]
+        )
+    print(f"Compiling {paper['id']}")
+    subprocess.call(
+        [
+            "pdflatex",
+            f"-output-directory={watermarked_pdfs}",
+            str(tex_file),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        shell=False,
+    )
+    returncode = subprocess.call(
+        [
+            "pdflatex",
+            "-halt-on-error",
+            f"-output-directory={watermarked_pdfs}",
+            str(tex_file),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        shell=False,
+    )
+    if returncode != 0:
+        # Some PAX errors can be handled by trying a second time.
+        subprocess.call(
+            [
+                "pdflatex",
+                "-halt-on-error",
+                f"-output-directory={watermarked_pdfs}",
+                str(tex_file),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            shell=False,
+        )
 
 
 def process_program_handbook(program):
@@ -400,7 +525,7 @@ def process_program_workshop_handbook(
 
 
 def normalize_latex_string(text: str) -> str:
-    return text.replace("’", "'").replace("&", "\\&")
+    return text.replace("’", "'").replace("&", "\\&").replace("_", "\\_")
 
 
 def load_configs(root: Path):
@@ -408,6 +533,10 @@ def load_configs(root: Path):
     Loads all conference configuration files defined in the root directory.
     """
     conference = load_config("conference_details", root, required=True)
+    for item in conference:
+        if isinstance(conference[item], str):
+            conference[item] = normalize_latex_string(conference[item])
+
     papers = load_config("papers", root, required=True)
     for paper in papers:
         paper["title"] = normalize_latex_string(paper["title"])
@@ -415,7 +544,15 @@ def load_configs(root: Path):
     prefaces = load_config("prefaces", root)
     organizing_committee = load_config("organizing_committee", root)
     program_committee = load_config("program_committee", root)
+    for block in program_committee:
+        for entry in block["entries"]:
+            for k, v in entry.items():
+                entry[k] = normalize_latex_string(v)
     invited_talks = load_config("invited_talks", root)
+    program = load_config("program", root)
+    if program is not None:
+        for entry in program:
+            entry["title"] = normalize_latex_string(entry["title"])
 
     return (
         conference,
@@ -425,6 +562,7 @@ def load_configs(root: Path):
         organizing_committee,
         program_committee,
         invited_talks,
+        program,
     )
 
 
@@ -440,6 +578,11 @@ def load_configs_handbook(root: Path):
     prefaces = load_config("prefaces_handbook", root)
     organizing_committee = load_config("organizing_committee", root)
     program_committee = load_config("program_committee", root)
+    for block in program_committee:
+        for entry in block["entries"]:
+            for k, v in entry.items():
+                print(k, v)
+                entry[k] = normalize_latex_string(v)
     tutorial_program = load_config("tutorial_program", root)
     tutorials = load_config("tutorials", root)
     invited_talks = load_config("invited_talks", root, required=False)
